@@ -959,10 +959,10 @@ function saveKey() {
 function skipKey() { document.getElementById('key-overlay').classList.remove('show'); }
 // ทุกตัวต้องเป็น vision-capable — สลิปเป็นรูป ถ้า fallback อ่านรูปไม่ได้จะ fail ทั้งแถว
 const SLIP_MODELS = [
-  'google/gemma-4-26b-a4b-it',                       // primary (vision)
-  'meta-llama/llama-3.2-11b-vision-instruct:free',   // fallback 1 (vision + free)
-  'google/gemma-3-12b-it:free',                      // fallback 2 (vision + free)
-  'google/gemma-3-4b-it:free',                       // fallback 3 (vision + free)
+  'google/gemma-4-26b-a4b-it:free',                  // primary   — free, reads Thai slips correctly
+  'google/gemma-4-31b-it',                           // fallback 1 — paid, same accuracy (~$0.05 / 1000 slips)
+  'google/gemma-4-26b-a4b-it',                       // fallback 2 — paid twin of primary (~$0.07 / 1000 slips)
+  'google/gemma-3-4b-it',                            // fallback 3 — cheapest, but misreads date/recipient
 ];
 
 async function orFetch(model, messages) {
@@ -1139,7 +1139,8 @@ async function geminiScanSlip(file, idx) {
 - อ่านเลขปีให้ครบทุกหลักอย่างระมัดระวัง อย่าสับสน 6 กับ 9
 - ปีที่ได้ต้องอยู่ระหว่าง ${curYr-1} ถึง ${curYr} เท่านั้น ถ้าได้ปีอื่นแสดงว่าอ่านผิด ให้อ่านใหม่
 ถ้าหาข้อมูลไม่เจอใส่ null`;
-  let lastErr = '';
+  const errs = [];
+  let offYear = null;  // parsed result with a suspect year — kept in case every model misreads it
 
   for (const model of SLIP_MODELS) {
     try {
@@ -1153,13 +1154,23 @@ async function geminiScanSlip(file, idx) {
       }]);
       console.log(`[slip ${idx+1}] ${model} →`, text);
       const p = parseSlipJson(text);
-      return { ok: true, amount: p.amount, date: p.date, recipient: p.recipient, category: slipCats[idx], url: slipURLs[idx], model };
+      const hit = { ok: true, amount: p.amount, date: p.date, recipient: p.recipient, category: slipCats[idx], url: slipURLs[idx], model };
+      // models misread the BE year at random (2569 → 2016); hand the slip to the next one instead
+      const yr = +normalizeDate(p.date).slice(0, 4);
+      if (yr < curYr - 1 || yr > curYr) {
+        offYear = offYear || hit;
+        throw new Error(`year out of range: ${p.date}`);
+      }
+      return hit;
     } catch(e) {
       console.warn(`[slip ${idx+1}] ${model} failed:`, e.message);
-      lastErr = `${model.split('/')[1]}: ${e.message}`;
+      errs.push(`${model.split('/')[1]}: ${e.message}`);
     }
   }
-  return { ok: false, errMsg: lastErr, category: slipCats[idx], url: slipURLs[idx] };
+  // every model doubted the year: still show the amount/recipient, the date field warns on its own
+  if (offYear) return offYear;
+  // show every model's error — a single last error hides that the whole chain died
+  return { ok: false, errMsg: errs.join(' | '), category: slipCats[idx], url: slipURLs[idx] };
 }
 
 function normalizeDate(dateStr) {
