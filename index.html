@@ -335,7 +335,7 @@
         <button class="mo-nav" onclick="chgMo(1)">›</button>
         <button class="mo-nav" onclick="exportCsv()" title="Export CSV" style="font-size:16px">⬇️</button>
         <button class="mo-nav" onclick="document.getElementById('import-file-input').click()" title="Import CSV" style="font-size:16px">📥</button>
-        <input type="file" id="import-file-input" accept=".csv,.xlsx" style="display:none" onchange="handleImportFile(this)">
+        <input type="file" id="import-file-input" style="display:none" onchange="handleImportFile(this)">
       </div>
     </div>
     <div class="sm-grid">
@@ -696,11 +696,16 @@ function exportCsv() {
   const firstP = periodKey(txs[0].date);
   const lastP = periodKey(txs[txs.length-1].date);
   const fname = firstP === lastP ? `budget_${firstP}.csv` : `budget_${firstP}_${lastP}.csv`;
+  const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob);
+  a.href = url;
   a.download = fname;
+  a.style.display = 'none';
+  document.body.appendChild(a); // iOS/Safari ต้องอยู่ใน DOM จริงก่อน click
   a.click();
-  URL.revokeObjectURL(a.href);
+  a.remove();
+  // อย่า revoke ทันที — บางเบราว์เซอร์ (มือถือ) ยังเขียนไฟล์ไม่เสร็จ จะได้ไฟล์ 0 byte
+  setTimeout(() => URL.revokeObjectURL(url), 4000);
   toast('Export CSV สำเร็จ ✓');
 }
 
@@ -796,43 +801,78 @@ function normalizeXlsxRow(r) {
   return row;
 }
 
+// ตรวจชนิดไฟล์จาก "เนื้อหา" ไม่ใช่นามสกุล: xlsx คือ zip → ขึ้นต้นด้วย PK\x03\x04
+// (มือถือบางเครื่องไม่ส่งนามสกุล/ชนิดไฟล์มาครบ)
+function isZipBytes(bytes) {
+  return bytes.length > 3 && bytes[0] === 0x50 && bytes[1] === 0x4B && bytes[2] === 0x03 && bytes[3] === 0x04;
+}
+
+function splitImportRows(text) {
+  if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1); // strip BOM
+  return parseCsv(text).filter(r => r.length && !r.every(f => String(f).trim() === ''));
+}
+
+function headerIsValid(rows) {
+  if (!rows.length) return false;
+  const h = rows[0].map(v => String(v).trim());
+  return h.length === IMPORT_HEADER.length && h.every((v, i) => v === IMPORT_HEADER[i]);
+}
+
+function decodeCsvBuffer(buf) {
+  const bytes = new Uint8Array(buf);
+  const utf8 = new TextDecoder('utf-8').decode(bytes);
+  if (headerIsValid(splitImportRows(utf8))) return utf8;
+  // Excel ฝั่ง Windows เซฟ CSV เป็น TIS-620 (cp874) → อ่านแบบ utf-8 แล้วหัวตารางไทยเพี้ยน
+  try {
+    const cp874 = new TextDecoder('windows-874').decode(bytes);
+    if (headerIsValid(splitImportRows(cp874))) return cp874;
+  } catch {}
+  return utf8;
+}
+
 function handleImportFile(input) {
-  const file = input.files[0];
+  const file = input.files && input.files[0];
   input.value = ''; // allow re-selecting the same file next time
   if (!file) return;
   const reader = new FileReader();
-  reader.onerror = () => toast('ไฟล์ไม่ถูกต้อง');
-  if (/\.xlsx$/i.test(file.name)) {
-    reader.onload = () => {
-      loadSheetJs().then(() => {
-        let rows;
-        try {
-          const wb = XLSX.read(reader.result, { type: 'array' });
-          const ws = wb.Sheets[wb.SheetNames[0]];
-          rows = XLSX.utils.sheet_to_json(ws, { header: 1, raw: true, defval: '' });
-        } catch { toast('ไฟล์ไม่ถูกต้อง'); return; }
-        processImportRows(rows.map(normalizeXlsxRow));
-      }).catch(() => toast('โหลดตัวอ่าน Excel ไม่ได้ — เช็คอินเทอร์เน็ต'));
-    };
-    reader.readAsArrayBuffer(file);
-  } else {
-    reader.onload = () => processImportText(reader.result);
-    reader.readAsText(file, 'utf-8');
-  }
+  reader.onerror = () => toast('อ่านไฟล์ไม่ได้ — ลองเลือกไฟล์ใหม่');
+  reader.onload = () => {
+    const buf = reader.result;
+    if (isZipBytes(new Uint8Array(buf))) importXlsxBuffer(buf);
+    else processImportText(decodeCsvBuffer(buf));
+  };
+  reader.readAsArrayBuffer(file);
+}
+
+function importXlsxBuffer(buf) {
+  loadSheetJs().then(() => {
+    let rows;
+    try {
+      const wb = XLSX.read(buf, { type: 'array' });
+      const ws = wb.Sheets[wb.SheetNames[0]];
+      rows = XLSX.utils.sheet_to_json(ws, { header: 1, raw: true, defval: '' });
+    } catch { toast('ไฟล์ Excel ไม่ถูกต้อง'); return; }
+    processImportRows(rows.map(normalizeXlsxRow));
+  }).catch(() => toast('โหลดตัวอ่าน Excel ไม่ได้ — เช็คอินเทอร์เน็ต'));
 }
 
 function processImportText(text) {
-  if (!text) { toast('ไฟล์ไม่ถูกต้อง'); return; }
-  if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1); // strip BOM
-  processImportRows(parseCsv(text));
+  if (!text || !text.trim()) { toast('ไฟล์ว่าง — ดาวน์โหลด CSV ใหม่อีกครั้ง'); return; }
+  processImportRows(splitImportRows(text));
 }
 
 function processImportRows(rows) {
   rows = rows.filter(r => r.length && !r.every(f => String(f).trim() === ''));
-  if (!rows.length) { toast('ไฟล์ไม่ถูกต้อง'); return; }
+  if (!rows.length) { toast('ไฟล์ว่าง — ไม่มีข้อมูลในไฟล์'); return; }
   const header = rows[0].map(h => String(h).trim());
   if (header.length !== IMPORT_HEADER.length || !header.every((h,i) => h === IMPORT_HEADER[i])) {
-    toast('ไฟล์ไม่ถูกต้อง'); return;
+    showImportSheet([
+      'หัวตาราง (header) ไม่ตรงกับที่แอพรองรับ',
+      `ต้องเป็น: ${IMPORT_HEADER.join(', ')}`,
+      `ที่พบ: ${header.filter(h => h).join(', ') || '(ไม่พบหัวตาราง)'}`,
+      'ถ้าเปิดไฟล์นี้ใน Excel แล้วเซฟทับ ให้ export ใหม่จากแอพ หรือใช้ไฟล์ .xlsx',
+    ], false);
+    return;
   }
   const dataRows = rows.slice(1);
   const existing = getTxs();
@@ -853,13 +893,17 @@ function processImportRows(rows) {
   showImportConfirm(dataRows.length, toAdd.length, dupCount, invalidCount);
 }
 
+function showImportSheet(lines, canImport) {
+  document.getElementById('import-msg').innerHTML = lines.join('<br>');
+  const btn = document.getElementById('import-confirm-btn');
+  btn.disabled = !canImport;
+  document.getElementById('import-overlay').classList.add('show');
+}
 function showImportConfirm(n, x, y, z) {
   const lines = [`พบ ${n} รายการในไฟล์`, `เพิ่มใหม่ ${x}`, `ซ้ำ (ข้าม) ${y}`];
   if (z > 0) lines.push(`อ่านไม่ได้ ${z}`);
-  document.getElementById('import-msg').innerHTML = lines.join('<br>');
-  const btn = document.getElementById('import-confirm-btn');
-  btn.disabled = x === 0;
-  document.getElementById('import-overlay').classList.add('show');
+  if (n > 0 && x === 0) lines.push(y > 0 ? 'ข้อมูลในไฟล์นี้มีอยู่แล้วทั้งหมด — ไม่มีอะไรต้องนำเข้า' : 'ไม่มีรายการที่นำเข้าได้');
+  showImportSheet(lines, x > 0);
 }
 function closeImportSheet() {
   pendingImport = [];
